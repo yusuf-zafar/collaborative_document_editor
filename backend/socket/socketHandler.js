@@ -244,30 +244,37 @@ module.exports = (io) => {
     // Handle document editing
     socket.on('documentEdit', async (data) => {
       try {
-        const { documentId, operation, content } = data;
+        const { documentId, operation, content, title } = data;
         const connection = activeConnections.get(socket.id);
         
         if (!connection || connection.currentDocument !== documentId) {
           return;
         }
 
-        // Batch the operation
-        batchDocumentOperation(documentId, {
-          documentId,
-          userId: socket.userId,
-          type: operation.type,
-          position: operation.position,
-          content: operation.content,
-          length: operation.length,
-          finalContent: content
-        });
+        // Handle title changes
+        if (operation.type === 'title' && title) {
+          await db.query('UPDATE documents SET title = $1, updated_at = NOW() WHERE id = $2', [title, documentId]);
+          console.log(`📝 Title changed by ${socket.username} in document ${documentId}: "${title}"`);
+        } else {
+          // Batch the operation for content changes
+          batchDocumentOperation(documentId, {
+            documentId,
+            userId: socket.userId,
+            type: operation.type,
+            position: operation.position,
+            content: operation.content,
+            length: operation.length,
+            finalContent: content
+          });
+        }
 
         // Broadcast to other users in the document
         socket.to(documentId).emit('documentEdit', {
           userId: socket.userId,
           username: socket.username,
           operation,
-          content
+          content,
+          title
         });
 
       } catch (error) {

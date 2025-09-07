@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { useSocket } from '../contexts/SocketContext';
+import { getUserColor, getUserColorUnique } from '../utils/userColors';
 import axios from 'axios';
 import Chat from './Chat';
 
@@ -20,10 +21,12 @@ const DocumentEditor = () => {
   const [typing, setTyping] = useState([]);
   const [isTyping, setIsTyping] = useState(false);
   const [showChat, setShowChat] = useState(true);
+  const [connectionRestored, setConnectionRestored] = useState(false);
   
   const editorRef = useRef(null);
   const typingTimeoutRef = useRef(null);
   const lastContentRef = useRef('');
+  const prevConnectedRef = useRef(false);
 
   useEffect(() => {
     fetchDocument();
@@ -35,6 +38,7 @@ const DocumentEditor = () => {
       
       // Only join document when socket is connected
       if (socket.connected) {
+        console.log('Socket already connected, joining document...');
         socket.emit('joinDocument', { documentId });
       }
       
@@ -54,13 +58,50 @@ const DocumentEditor = () => {
       socket.on('reconnect', handleReconnect);
       
       return () => {
-        socket.emit('leaveDocument', { documentId });
+        if (socket.connected) {
+          socket.emit('leaveDocument', { documentId });
+        }
         cleanupSocketListeners();
         socket.off('connect', handleConnect);
         socket.off('reconnect', handleReconnect);
       };
     }
   }, [socket, documentId]);
+
+  // Effect to handle socket connection restoration
+  useEffect(() => {
+    if (socket && connected && documentId) {
+      console.log('Socket connected, ensuring document join...');
+      socket.emit('joinDocument', { documentId });
+      
+      // Only show connection restored notification if we were previously disconnected
+      if (!prevConnectedRef.current) {
+        setConnectionRestored(true);
+        setTimeout(() => setConnectionRestored(false), 3000);
+      }
+      
+      prevConnectedRef.current = true;
+    } else if (!connected) {
+      prevConnectedRef.current = false;
+    }
+  }, [socket, connected, documentId]);
+
+  // Separate effect to sync content changes after reconnection
+  useEffect(() => {
+    if (socket && connected && documentId && content !== lastContentRef.current) {
+      console.log('Syncing local content changes after reconnection...');
+      socket.emit('documentEdit', {
+        documentId,
+        operation: {
+          type: 'replace',
+          content: content,
+          position: 0
+        },
+        content: content
+      });
+      lastContentRef.current = content;
+    }
+  }, [socket, connected, documentId, content]);
 
   const setupSocketListeners = () => {
     if (!socket) return;
@@ -103,6 +144,10 @@ const DocumentEditor = () => {
       if (data.userId !== user.id) {
         setContent(data.content);
         lastContentRef.current = data.content;
+        // Also update title if it's included in the edit data
+        if (data.title !== undefined) {
+          setTitle(data.title);
+        }
       }
     });
 
@@ -192,49 +237,58 @@ const DocumentEditor = () => {
     const newContent = e.target.value;
     setContent(newContent);
     
-    // Send typing indicator
-    if (!isTyping) {
-      setIsTyping(true);
-      socket?.emit('typing', { documentId, isTyping: true, type: 'editor' });
-    }
-    
-    // Clear existing timeout
-    if (typingTimeoutRef.current) {
-      clearTimeout(typingTimeoutRef.current);
-    }
-    
-    // Set new timeout
-    typingTimeoutRef.current = setTimeout(() => {
-      setIsTyping(false);
-      socket?.emit('typing', { documentId, isTyping: false, type: 'editor' });
-    }, 1000);
+    // Only send real-time updates if connected
+    if (connected && socket) {
+      // Send typing indicator
+      if (!isTyping) {
+        setIsTyping(true);
+        socket.emit('typing', { documentId, isTyping: true, type: 'editor' });
+      }
+      
+      // Clear existing timeout
+      if (typingTimeoutRef.current) {
+        clearTimeout(typingTimeoutRef.current);
+      }
+      
+      // Set new timeout
+      typingTimeoutRef.current = setTimeout(() => {
+        setIsTyping(false);
+        socket.emit('typing', { documentId, isTyping: false, type: 'editor' });
+      }, 1000);
 
-    // Send edit to other users
-    if (socket && newContent !== lastContentRef.current) {
-      socket.emit('documentEdit', {
-        documentId,
-        operation: {
-          type: 'replace',
-          content: newContent,
-          position: e.target.selectionStart
-        },
-        content: newContent
-      });
-      lastContentRef.current = newContent;
+      // Send edit to other users
+      if (newContent !== lastContentRef.current) {
+        socket.emit('documentEdit', {
+          documentId,
+          operation: {
+            type: 'replace',
+            content: newContent,
+            position: e.target.selectionStart
+          },
+          content: newContent
+        });
+        lastContentRef.current = newContent;
+      }
+    } else {
+      // If not connected, still update local content but warn user
+      console.warn('Not connected to server - changes will be saved locally only');
     }
-  }, [socket, documentId, isTyping]);
+  }, [socket, documentId, isTyping, connected]);
 
   const handleTitleChange = async (e) => {
     const newTitle = e.target.value;
     setTitle(newTitle);
     
-    // Send title change to other users immediately
-    if (socket) {
-      socket.emit('titleChange', {
+    // Send title change as part of document edit if connected
+    if (connected && socket) {
+      socket.emit('documentEdit', {
         documentId,
-        title: newTitle,
-        userId: user.id,
-        username: user.username
+        operation: {
+          type: 'title',
+          title: newTitle
+        },
+        content: content,
+        title: newTitle
       });
     }
     
@@ -253,7 +307,7 @@ const DocumentEditor = () => {
   };
 
   const handleCursorMove = useCallback((e) => {
-    if (socket) {
+    if (connected && socket) {
       const rect = e.target.getBoundingClientRect();
       const cursor = {
         x: e.clientX - rect.left,
@@ -263,7 +317,7 @@ const DocumentEditor = () => {
       
       socket.emit('cursorMove', { documentId, cursor });
     }
-  }, [socket, documentId]);
+  }, [socket, documentId, connected]);
 
   const handleKeyDown = useCallback((e) => {
     if (e.key === 'Tab') {
@@ -282,37 +336,12 @@ const DocumentEditor = () => {
 
   const titleTimeoutRef = useRef(null);
 
-  // Function to get a unique color for each user
-  const getUserColor = (userId) => {
-    const colors = [
-      '#007bff', // Blue
-      '#28a745', // Green
-      '#dc3545', // Red
-      '#ffc107', // Yellow
-      '#6f42c1', // Purple
-      '#17a2b8', // Cyan
-      '#fd7e14', // Orange
-      '#e83e8c'  // Pink
-    ];
-    
-    // Get all unique user IDs from cursors
-    const userIds = Object.keys(cursors).filter(id => id !== user.id);
-    const userIndex = userIds.indexOf(userId);
-    
-    // If user not found in current cursors, use hash as fallback
-    if (userIndex === -1) {
-      let hash = 0;
-      const str = userId.toString();
-      for (let i = 0; i < str.length; i++) {
-        const char = str.charCodeAt(i);
-        hash = ((hash << 5) - hash) + char;
-        hash = hash & hash;
-      }
-      return colors[Math.abs(hash) % colors.length];
-    }
-    
-    // Assign colors in order to ensure uniqueness
-    return colors[userIndex % colors.length];
+  // Create a combined list of all users for consistent colors across all components
+  const getAllUserIds = () => {
+    const presenceUserIds = presence.map(u => u.userId);
+    const cursorUserIds = Object.keys(cursors);
+    const allUserIds = [...new Set([...presenceUserIds, ...cursorUserIds])];
+    return allUserIds;
   };
 
   useEffect(() => {
@@ -346,110 +375,447 @@ const DocumentEditor = () => {
   }
 
   return (
-    <div>
-      <div className="header">
-        <div>
-          <h1>Document Editor</h1>
-          <p>Editing: {title}</p>
-          <div className="presence-list">
-            <span style={{ marginRight: '10px', fontSize: '12px', color: '#666' }}>
-              {presence.length} users online
-            </span>
-            {presence.map((user) => (
-              <span key={user.userId} className="presence-user">
-                {user.username}
-              </span>
-            ))}
+    <div style={{ 
+      minHeight: '100vh', 
+      background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+      padding: '0'
+    }}>
+      {/* Modern Header */}
+      <div style={{
+        background: 'rgba(255, 255, 255, 0.95)',
+        backdropFilter: 'blur(10px)',
+        borderBottom: '1px solid rgba(255, 255, 255, 0.2)',
+        padding: '20px 30px',
+        boxShadow: '0 4px 20px rgba(0, 0, 0, 0.1)',
+        position: 'sticky',
+        top: 0,
+        zIndex: 100
+      }}>
+        <div style={{ 
+          display: 'flex', 
+          justifyContent: 'space-between', 
+          alignItems: 'center',
+          maxWidth: '1400px',
+          margin: '0 auto'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '20px' }}>
+            <button 
+              onClick={() => navigate('/')} 
+              style={{
+                padding: '10px 20px',
+                background: 'white',
+                color: '#6c757d',
+                border: '2px solid #dee2e6',
+                borderRadius: '25px',
+                fontSize: '14px',
+                fontWeight: '600',
+                cursor: 'pointer',
+                transition: 'all 0.3s ease',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px'
+              }}
+              onMouseOver={(e) => {
+                e.target.style.background = '#6c757d';
+                e.target.style.color = 'white';
+                e.target.style.borderColor = '#6c757d';
+              }}
+              onMouseOut={(e) => {
+                e.target.style.background = 'white';
+                e.target.style.color = '#6c757d';
+                e.target.style.borderColor = '#dee2e6';
+              }}
+            >
+              ← Back to Documents
+            </button>
+            <div>
+              <h1 style={{ 
+                margin: '0 0 8px 0', 
+                fontSize: '28px', 
+                fontWeight: '700',
+                background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                WebkitBackgroundClip: 'text',
+                WebkitTextFillColor: 'transparent',
+                backgroundClip: 'text'
+              }}>
+                📝 Collaborative Editor
+              </h1>
+              <div style={{ 
+                display: 'flex', 
+                alignItems: 'center', 
+                gap: '20px',
+                marginTop: '8px'
+              }}>
+                <div style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px',
+                  padding: '6px 12px',
+                  background: connected ? '#d4edda' : '#f8d7da',
+                  borderRadius: '20px',
+                  fontSize: '12px',
+                  fontWeight: '500'
+                }}>
+                  <div style={{
+                    width: '8px',
+                    height: '8px',
+                    borderRadius: '50%',
+                    background: connected ? '#28a745' : '#dc3545',
+                    animation: connected ? 'pulse 2s infinite' : 'none'
+                  }} />
+                  {connected ? 'Live Sync' : 'Disconnected'}
+                </div>
+                <div style={{ 
+                  display: 'flex', 
+                  alignItems: 'center', 
+                  gap: '8px',
+                  fontSize: '14px',
+                  color: '#666'
+                }}>
+                  <span>👥 {presence.length} online</span>
+                  <div style={{ display: 'flex', gap: '4px' }}>
+                    {presence.slice(0, 3).map((user) => (
+                      <div title={user.username} key={user.userId} style={{
+                        width: '32px',
+                        height: '32px',
+                        borderRadius: '50%',
+                        background: `linear-gradient(135deg, ${getUserColorUnique(user.userId, getAllUserIds())}, ${getUserColorUnique(user.userId, getAllUserIds())}dd)`,
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        color: 'white',
+                        fontSize: '12px',
+                        fontWeight: '600',
+                        border: '2px solid white',
+                        boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
+                        cursor: 'pointer'
+                      }}>
+                        {user.username.charAt(0).toUpperCase()}
+                      </div>
+                    ))}
+                    {presence.length > 3 && (
+                      <div style={{
+                        width: '32px',
+                        height: '32px',
+                        borderRadius: '50%',
+                        background: '#6c757d',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        color: 'white',
+                        fontSize: '12px',
+                        fontWeight: '600',
+                        border: '2px solid white'
+                      }}>
+                        +{presence.length - 3}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
-        </div>
-        <div>
+          
+          {/* Chat Toggle Button - Top right */}
           <button 
             onClick={() => setShowChat(!showChat)} 
-            className="btn btn-secondary"
-            style={{ marginRight: '10px' }}
+            style={{
+              padding: '10px 20px',
+              background: showChat ? 'white' : 'linear-gradient(135deg, #667eea, #764ba2)',
+              color: showChat ? '#6c757d' : 'white',
+              border: showChat ? '2px solid #dee2e6' : 'none',
+              borderRadius: '25px',
+              fontSize: '14px',
+              fontWeight: '600',
+              cursor: 'pointer',
+              transition: 'all 0.3s ease',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              boxShadow: showChat ? '0 2px 8px rgba(0,0,0,0.1)' : '0 4px 12px rgba(102, 126, 234, 0.3)'
+            }}
+            onMouseOver={(e) => {
+              if (showChat) {
+                e.target.style.background = '#6c757d';
+                e.target.style.color = 'white';
+                e.target.style.borderColor = '#6c757d';
+              } else {
+                e.target.style.transform = 'translateY(-1px)';
+                e.target.style.boxShadow = '0 6px 16px rgba(102, 126, 234, 0.4)';
+              }
+            }}
+            onMouseOut={(e) => {
+              if (showChat) {
+                e.target.style.background = 'white';
+                e.target.style.color = '#6c757d';
+                e.target.style.borderColor = '#dee2e6';
+              } else {
+                e.target.style.transform = 'translateY(0)';
+                e.target.style.boxShadow = '0 4px 12px rgba(102, 126, 234, 0.3)';
+              }
+            }}
           >
-            {showChat ? 'Hide Chat' : 'Show Chat'}
-          </button>
-          <button onClick={() => navigate('/')} className="btn btn-secondary">
-            Back to Documents
+            {showChat ? '✕' : '💬'}
+            {showChat ? ' Hide Chat' : ' Show Chat'}
           </button>
         </div>
       </div>
 
-      <div style={{ display: 'flex', gap: '20px' }}>
+      {/* Main Content Area */}
+      <div style={{ 
+        display: 'flex', 
+        gap: '30px', 
+        padding: '30px',
+        maxWidth: '1400px',
+        margin: '0 auto',
+        minHeight: 'calc(100vh - 120px)'
+      }}>
         <div style={{ flex: 1 }}>
-          <div className="editor-container">
-            <div className="editor-toolbar">
+          {/* Modern Editor Container */}
+          <div style={{
+            background: 'white',
+            borderRadius: '16px',
+            boxShadow: '0 10px 40px rgba(0, 0, 0, 0.1)',
+            overflow: 'hidden',
+            position: 'relative'
+          }}>
+            {/* Title Input */}
+            <div style={{
+              padding: '30px 30px 20px 30px',
+              borderBottom: '1px solid #f0f0f0',
+              background: 'linear-gradient(135deg, #f8f9ff 0%, #ffffff 100%)'
+            }}>
               <input
                 type="text"
                 value={title}
                 onChange={handleTitleChange}
-                className="input"
-                style={{ border: 'none', background: 'transparent', fontSize: '16px', fontWeight: '600' }}
-                placeholder="Document title"
+                style={{ 
+                  width: '100%',
+                  border: 'none', 
+                  background: 'transparent', 
+                  fontSize: '24px', 
+                  fontWeight: '700',
+                  color: '#2c3e50',
+                  outline: 'none',
+                  padding: '0',
+                  fontFamily: 'inherit'
+                }}
+                placeholder="Untitled Document"
               />
-              <div style={{ fontSize: '12px', color: '#666' }}>
-                Connection: {connected ? '🟢 Connected' : '🔴 Disconnected'}
+              <div style={{
+                marginTop: '12px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '12px',
+                fontSize: '13px',
+                color: '#6c757d'
+              }}>
+                <div style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                  padding: '4px 8px',
+                  background: connected ? '#e8f5e8' : '#ffeaea',
+                  borderRadius: '12px',
+                  fontWeight: '500'
+                }}>
+                  <div style={{
+                    width: '6px',
+                    height: '6px',
+                    borderRadius: '50%',
+                    background: connected ? '#28a745' : '#dc3545'
+                  }} />
+                  {connected ? 'Live editing' : 'Offline'}
+                </div>
+                <span>•</span>
+                <span>{content.length} characters</span>
+                <span>•</span>
+                <span>{content.split('\n').length} lines</span>
               </div>
             </div>
-            <textarea
-              ref={editorRef}
-              className="editor-content"
-              value={content}
-              onChange={handleContentChange}
-              onKeyDown={handleKeyDown}
-              onMouseMove={handleCursorMove}
-              onKeyUp={handleCursorMove}
-              onFocus={handleCursorMove}
-              style={{ 
-                minHeight: '500px', 
-                width: '100%', 
-                border: '1px solid #ddd', 
-                padding: '10px',
-                fontFamily: 'inherit',
-                fontSize: '14px',
-                lineHeight: '1.5',
-                resize: 'vertical'
-              }}
-              placeholder="Start typing your document..."
-            />
-            {/* Render cursors - only show other users' cursors */}
-            {Object.entries(cursors)
-              .filter(([userId]) => userId !== user.id) // Don't show own cursor
-              .map(([userId, cursor]) => (
-                <div
-                  key={userId}
-                  className="cursor"
-                  style={{
-                    left: cursor.x,
-                    top: cursor.y + 25, // Position name tag right above cursor
-                    backgroundColor: getUserColor(userId)
-                  }}
-                >
-                  {cursor.username}
-                </div>
-              ))}
+
+            {/* Content Editor */}
+            <div style={{ position: 'relative' }}>
+              <textarea
+                ref={editorRef}
+                value={content}
+                onChange={handleContentChange}
+                onKeyDown={handleKeyDown}
+                onMouseMove={handleCursorMove}
+                onKeyUp={handleCursorMove}
+                onFocus={handleCursorMove}
+                style={{ 
+                  width: '100%',
+                  minHeight: '500px', 
+                  border: 'none',
+                  padding: '30px',
+                  fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+                  fontSize: '16px',
+                  lineHeight: '1.7',
+                  resize: 'none',
+                  outline: 'none',
+                  background: 'white',
+                  color: '#2c3e50'
+                }}
+                placeholder="Start writing your document here... 
+
+💡 Tip: This editor supports real-time collaboration. Changes will appear instantly for other users!"
+              />
+              {/* Render cursors - only show other users' cursors */}
+              {Object.entries(cursors)
+                .filter(([userId]) => userId !== user.id) // Don't show own cursor
+                .map(([userId, cursor]) => (
+                  <div
+                    key={userId}
+                    style={{
+                      position: 'absolute',
+                      left: cursor.x,
+                      top: cursor.y + 30,
+                      background: `linear-gradient(135deg, ${getUserColorUnique(userId, getAllUserIds())}, ${getUserColorUnique(userId, getAllUserIds())}dd)`,
+                      color: 'white',
+                      padding: '4px 12px',
+                      borderRadius: '20px',
+                      fontSize: '12px',
+                      fontWeight: '600',
+                      boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+                      zIndex: 10,
+                      pointerEvents: 'none',
+                      border: '2px solid white',
+                      animation: 'fadeIn 0.3s ease'
+                    }}
+                  >
+                    {cursor.username}
+                  </div>
+                ))}
+            </div>
           </div>
+
+          {/* Connection restored notification */}
+          {connectionRestored && (
+            <div style={{
+              position: 'fixed',
+              top: '30px',
+              right: '30px',
+              background: 'linear-gradient(135deg, #28a745, #20c997)',
+              color: 'white',
+              padding: '16px 24px',
+              borderRadius: '12px',
+              boxShadow: '0 8px 32px rgba(40, 167, 69, 0.3)',
+              zIndex: 1000,
+              animation: 'slideIn 0.4s ease',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '12px',
+              fontSize: '14px',
+              fontWeight: '600',
+              border: '1px solid rgba(255,255,255,0.2)'
+            }}>
+              <div style={{
+                width: '8px',
+                height: '8px',
+                borderRadius: '50%',
+                background: 'white',
+                animation: 'pulse 1.5s infinite'
+              }} />
+              ✨ Connection restored! Syncing changes...
+            </div>
+          )}
 
           {/* Typing indicators */}
           {typing.length > 0 && (
-            <div className="typing-indicator">
+            <div style={{
+              position: 'fixed',
+              bottom: '30px',
+              left: '30px',
+              background: 'rgba(255, 255, 255, 0.95)',
+              backdropFilter: 'blur(10px)',
+              padding: '12px 20px',
+              borderRadius: '25px',
+              boxShadow: '0 4px 20px rgba(0, 0, 0, 0.1)',
+              border: '1px solid rgba(255, 255, 255, 0.2)',
+              fontSize: '14px',
+              color: '#6c757d',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              zIndex: 1000
+            }}>
+              <div style={{
+                display: 'flex',
+                gap: '2px'
+              }}>
+                <div style={{
+                  width: '4px',
+                  height: '4px',
+                  borderRadius: '50%',
+                  background: '#667eea',
+                  animation: 'typing 1.4s infinite ease-in-out'
+                }} />
+                <div style={{
+                  width: '4px',
+                  height: '4px',
+                  borderRadius: '50%',
+                  background: '#667eea',
+                  animation: 'typing 1.4s infinite ease-in-out 0.2s'
+                }} />
+                <div style={{
+                  width: '4px',
+                  height: '4px',
+                  borderRadius: '50%',
+                  background: '#667eea',
+                  animation: 'typing 1.4s infinite ease-in-out 0.4s'
+                }} />
+              </div>
               {typing.map((user, index) => (
-                <span key={user.userId}>
-                  {user.username} is typing...
+                <span key={user.userId} style={{ fontWeight: '500' }}>
+                  {user.username}
                   {index < typing.length - 1 && ', '}
                 </span>
               ))}
+              <span>is typing...</span>
             </div>
           )}
         </div>
 
         {showChat && (
           <div style={{ width: '300px' }}>
-            <Chat documentId={documentId} />
+            <Chat 
+              documentId={documentId} 
+              presence={presence}
+              allUserIds={getAllUserIds()}
+            />
           </div>
         )}
       </div>
+
+      {/* CSS Animations */}
+      <style jsx>{`
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.5; }
+        }
+        
+        @keyframes slideIn {
+          from {
+            transform: translateX(100%);
+            opacity: 0;
+          }
+          to {
+            transform: translateX(0);
+            opacity: 1;
+          }
+        }
+        
+        @keyframes fadeIn {
+          from { opacity: 0; transform: scale(0.8); }
+          to { opacity: 1; transform: scale(1); }
+        }
+        
+        @keyframes typing {
+          0%, 60%, 100% { transform: translateY(0); }
+          30% { transform: translateY(-10px); }
+        }
+      `}</style>
     </div>
   );
 };

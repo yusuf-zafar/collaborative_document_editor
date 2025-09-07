@@ -15,17 +15,23 @@ export const useSocket = () => {
 export const SocketProvider = ({ children }) => {
   const [socket, setSocket] = useState(null);
   const [connected, setConnected] = useState(false);
-  const { user } = useAuth();
+  const { user, loading } = useAuth();
 
   useEffect(() => {
-    if (user) {
+    // Only create socket when user is available and not loading
+    if (user && !loading) {
       const token = localStorage.getItem('token');
       const newSocket = io(process.env.REACT_APP_SOCKET_URL, {
         auth: {
           token
         },
         withCredentials: true,
-        transports: ['websocket', 'polling']
+        transports: ['websocket', 'polling'],
+        autoConnect: true,
+        reconnection: true,
+        reconnectionDelay: 1000,
+        reconnectionAttempts: 5,
+        maxReconnectionAttempts: 5
       });
 
       newSocket.on('connect', () => {
@@ -36,6 +42,11 @@ export const SocketProvider = ({ children }) => {
       newSocket.on('disconnect', () => {
         console.log('Socket disconnected');
         setConnected(false);
+      });
+
+      newSocket.on('reconnect', () => {
+        console.log('Socket reconnected');
+        setConnected(true);
       });
 
       newSocket.on('connect_error', (error) => {
@@ -50,8 +61,15 @@ export const SocketProvider = ({ children }) => {
         setSocket(null);
         setConnected(false);
       };
+    } else if (!loading && !user) {
+      // If not loading and no user, ensure socket is cleaned up
+      if (socket) {
+        socket.close();
+        setSocket(null);
+        setConnected(false);
+      }
     }
-  }, [user]);
+  }, [user, loading]);
 
   const value = {
     socket,
