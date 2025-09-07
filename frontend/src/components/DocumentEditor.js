@@ -319,6 +319,16 @@ const DocumentEditor = () => {
     }
   }, [socket, documentId, connected]);
 
+  const handleMouseLeave = useCallback(() => {
+    if (connected && socket) {
+      // Clear cursor when mouse leaves textarea
+      socket.emit('cursorMove', { 
+        documentId, 
+        cursor: { x: -1, y: -1, position: 0 } // Invalid coordinates to hide cursor
+      });
+    }
+  }, [socket, documentId, connected]);
+
   const handleKeyDown = useCallback((e) => {
     if (e.key === 'Tab') {
       e.preventDefault();
@@ -642,6 +652,7 @@ const DocumentEditor = () => {
                 onChange={handleContentChange}
                 onKeyDown={handleKeyDown}
                 onMouseMove={handleCursorMove}
+                onMouseLeave={handleMouseLeave}
                 onKeyUp={handleCursorMove}
                 onFocus={handleCursorMove}
                 style={{ 
@@ -664,13 +675,14 @@ const DocumentEditor = () => {
               {/* Render cursors - only show other users' cursors */}
               {Object.entries(cursors)
                 .filter(([userId]) => userId !== user.id) // Don't show own cursor
+                .filter(([userId, cursor]) => cursor.x >= 0 && cursor.y >= 0) // Only show valid coordinates
                 .map(([userId, cursor]) => (
                   <div
                     key={userId}
                     style={{
                       position: 'absolute',
                       left: cursor.x,
-                      top: cursor.y + 30,
+                      top: cursor.y - 30,
                       background: `linear-gradient(135deg, ${getUserColorUnique(userId, getAllUserIds())}, ${getUserColorUnique(userId, getAllUserIds())}dd)`,
                       color: 'white',
                       padding: '4px 12px',
