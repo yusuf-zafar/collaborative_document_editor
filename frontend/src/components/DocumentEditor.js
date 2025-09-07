@@ -27,9 +27,12 @@ const DocumentEditor = () => {
   const typingTimeoutRef = useRef(null);
   const lastContentRef = useRef('');
   const prevConnectedRef = useRef(false);
+  const cursorCleanupRef = useRef(null);
 
   useEffect(() => {
     fetchDocument();
+    // Clear any stuck cursors when document changes
+    setCursors({});
   }, [documentId]);
 
   useEffect(() => {
@@ -210,6 +213,9 @@ const DocumentEditor = () => {
     socket.off('titleChange');
     socket.off('error');
     socket.off('disconnect');
+    
+    // Clear cursors when cleaning up
+    setCursors({});
   };
 
   const fetchDocument = async () => {
@@ -312,7 +318,8 @@ const DocumentEditor = () => {
       const cursor = {
         x: e.clientX - rect.left,
         y: e.clientY - rect.top,
-        position: e.target.selectionStart
+        position: e.target.selectionStart,
+        timestamp: Date.now()
       };
       
       socket.emit('cursorMove', { documentId, cursor });
@@ -354,6 +361,32 @@ const DocumentEditor = () => {
     return allUserIds;
   };
 
+  // Clean up stale cursors periodically
+  useEffect(() => {
+    const cleanupStaleCursors = () => {
+      const now = Date.now();
+      setCursors(prev => {
+        const cleaned = {};
+        Object.entries(prev).forEach(([userId, cursor]) => {
+          // Keep cursors that have been updated within the last 5 seconds
+          if (cursor.timestamp && (now - cursor.timestamp) < 5000) {
+            cleaned[userId] = cursor;
+          }
+        });
+        return cleaned;
+      });
+    };
+
+    // Run cleanup every 2 seconds
+    cursorCleanupRef.current = setInterval(cleanupStaleCursors, 2000);
+
+    return () => {
+      if (cursorCleanupRef.current) {
+        clearInterval(cursorCleanupRef.current);
+      }
+    };
+  }, []);
+
   useEffect(() => {
     return () => {
       if (typingTimeoutRef.current) {
@@ -361,6 +394,9 @@ const DocumentEditor = () => {
       }
       if (titleTimeoutRef.current) {
         clearTimeout(titleTimeoutRef.current);
+      }
+      if (cursorCleanupRef.current) {
+        clearInterval(cursorCleanupRef.current);
       }
     };
   }, []);
